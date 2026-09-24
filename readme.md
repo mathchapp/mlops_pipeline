@@ -29,8 +29,6 @@ pip install -r requirements.txt
 python -m ipykernel install --user --name mlops_pipeline --display-name "Python (mlops_pipeline)"
 ```
 
-# Avance N°2
-
 # Avance N°3 
 
 ## Proceso y principales hallazgos
@@ -39,6 +37,51 @@ python -m ipykernel install --user --name mlops_pipeline --display-name "Python 
 2. **Variables:** numéricas con mediana y RobustScaler, categóricas nominales con moda y OneHotEncoder, ordinales con `Desconocida` y OrdinalEncoder. Se calculan ratios entre cuota/deudas y salario. El modelo excluye `puntaje` y saldos cuya disponibilidad antes del préstamo no está confirmada.
 3. **Modelado:** partición estratificada 60/20/20 en entrenamiento/validación/prueba. Se compararon Regresión logística, Random Forest y Gradient Boosting. El ganador por PR-AUC de validación fue Gradient Boosting (~0,136); en prueba obtuvo PR-AUC ~0,130 y recall ~0,725 con precisión ~0,077. Detecta muchos impagos, pero genera numerosas falsas alertas. El umbral se eligió en validación, no en prueba.
 4. **Monitoreo:** compara una referencia histórica fija con muestras **mensuales** de solicitudes recientes y calcula drift por variable y pronóstico. Emitir un alerta no demuestra que el modelo perdió rendimiento: se investiga el origen del cambio y, cuando se conozca el resultado real, se evalúa su calidad.
+
+## Avance 2: ingeniería de características y evaluación
+
+La variable objetivo original es `Pago_atiempo`. Para el modelado se definió
+`incumplimiento = 1` cuando el cliente no pagó a tiempo. Este es el evento
+que buscamos detectar.
+
+En `src/ft_engineering.py` se preparan las variables y se divide el dataset
+en entrenamiento (60 %), validación (20 %) y prueba reservada (20 %),
+manteniendo la proporción de incumplimientos. El preprocesamiento se ajusta
+solo con entrenamiento para evitar usar información de validación o prueba:
+se imputan valores faltantes, se escalan variables numéricas y se codifican
+variables categóricas nominales y ordinales. También se crean variables
+derivadas, como la relación entre cuota y salario.
+
+En `src/model_training_evaluation.py` se entrenaron y compararon tres modelos:
+
+| Modelo | PR-AUC validación | ROC-AUC validación | Recall validación | Precisión validación |
+|---|---:|---:|---:|---:|
+| Regresión logística | 0,0827 | 0,6165 | 0,5000 | 0,0773 |
+| Random Forest | 0,1148 | 0,6386 | 0,5784 | 0,0761 |
+| Gradient Boosting | **0,1361** | **0,6615** | **0,6765** | 0,0723 |
+
+Se eligió **Gradient Boosting** porque obtuvo el mayor PR-AUC en validación.
+Esta métrica resulta útil porque los incumplimientos son poco frecuentes:
+en el conjunto de validación hubo 102 casos entre 2.153 registros.
+
+El umbral de clasificación, **0,0358**, se seleccionó usando únicamente
+validación y priorizando la detección de incumplimientos mediante F2.
+Después se evaluó una sola vez el modelo elegido sobre la prueba reservada:
+
+| PR-AUC | ROC-AUC | Recall | Precisión | F2 |
+|---:|---:|---:|---:|---:|
+| 0,1298 | 0,7062 | 0,7255 | 0,0772 | 0,2707 |
+
+En prueba, el modelo identificó aproximadamente el **72,55 % de los
+incumplimientos**, pero su precisión fue del **7,72 %**: muchas alertas
+corresponderían a clientes que sí pagaron a tiempo. Por eso, el umbral
+necesita revisión según los costos y objetivos del negocio antes de usar
+las predicciones para tomar decisiones reales.
+
+Para reproducir el entrenamiento y generar las tablas, gráficos y el modelo:
+
+```powershell
+python src/model_training_evaluation.py
 
 ## Ejecutar el monitoreo
 
@@ -99,3 +142,48 @@ Los umbrales son decisiones iniciales para el ejercicio, **no estándares univer
 - **Sin datos:** esperar una muestra suficiente o agregar períodos justificados.
 
 
+## Avance 4: API y contenedor Docker
+
+`src/model_deploy.py` publica el pipeline completo mediante FastAPI. El endpoint
+`POST /predict` admite un registro o un lote en JSON y también un CSV enviado
+como cuerpo de la solicitud. La respuesta contiene la probabilidad de
+incumplimiento, la clase predicha y el umbral validado. `GET /health` permite
+comprobar que el modelo se encuentre disponible.
+
+Ejecución local, luego de generar el modelo del Avance 2:
+
+```powershell
+python -m uvicorn src.model_deploy:app --reload
+```
+
+Documentación interactiva: `http://127.0.0.1:8000/docs`.
+
+Desde `/docs`, abrir `POST /predict`, pulsar **Try it out**, conservar o editar
+el ejemplo JSON y pulsar **Execute**. También se puede enviar un lote como una
+lista de objetos o como `{"records": [...]}`.
+
+Ejemplo de predicción batch con PowerShell y un archivo CSV:
+
+```powershell
+Invoke-RestMethod -Uri http://127.0.0.1:8000/predict `
+  -Method Post -ContentType "text/csv" `
+  -InFile .\nuevas_solicitudes.csv
+```
+
+Construcción y ejecución del contenedor:
+
+```powershell
+docker build -t mlops-riesgo:v1.0 .
+docker run --rm -p 8000:8000 --name api-riesgo mlops-riesgo:v1.0
+```
+
+El `Dockerfile` usa Python 3.12, instala `requirements.txt`, copia el código y
+entrena el modelo durante la construcción para guardar el artefacto dentro de
+la imagen. El contenedor queda aislado de las carpetas locales de resultados.
+La API limita cada lote a 5.000 registros y no devuelve una aprobación de
+crédito: produce una alerta orientativa que requiere revisión humana.
+
+Para detener el contenedor desde otra terminal:
+
+```powershell
+docker stop api-riesgo
